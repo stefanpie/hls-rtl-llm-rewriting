@@ -64,13 +64,9 @@ def formal_equiv_yosys(
     s += "setundef -undriven -zero\n"
     s += "setundef -init -zero\n"
 
-    # s += "[strategy simple]\n"
-    # s += "use sat\n"
-    # s += "depth 5\n"
-
     s += "[strategy induction]\n"
     s += "use sby\n"
-    s += "engine abc pdr\n"
+    s += "engine smtbmc z3\n"
 
     eqy_config_fp.write_text(s)
 

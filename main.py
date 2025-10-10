@@ -192,7 +192,7 @@ llm: OpenRouterChat = OpenRouterChat(
 )
 
 
-def attempt_rewrite(
+def attempt_rewrite__oneshot(
     input_verilog: str,
     work_dir: Path,
     top_module: str,
@@ -240,6 +240,22 @@ def attempt_rewrite(
         )
 
 
+def attempt_rewrite__variables(
+    input_verilog: str,
+    work_dir: Path,
+    top_module: str,
+    design_dir: Path,
+):
+    # TODO: Implement a variable-only based LLM rewriting approach
+    # Input prompt is the original verilog with the verilog module + variables in the module we want to rename
+    # LLM output should be a mapping of old variable names we listed to new variable names
+    # Other Notes:
+    # - Maybe use structured output for LLM
+    # - Maybe use multiple rounds of variable renaming
+    # - Maybe use parser / AST to do the renaming based on the LLM generated mapping
+    #   or use some regex somehow carefully to rename variables a hacky way
+
+
 if __name__ == "__main__":
     # kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2
 
@@ -249,7 +265,7 @@ if __name__ == "__main__":
     top_module = "kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2"
 
     input_verilog = test_file_fp.read_text()
-    attempt_rewrite(
+    attempt_rewrite__oneshot(
         input_verilog=input_verilog,
         work_dir=DIR_CURRENT / "work" / top_module,
         top_module=top_module,

@@ -2,8 +2,8 @@ import os
 from pathlib import Path
 
 from hls_rtl_llm_rewriting.core import (
-    attempt_rewrite__oneshot,
     attempt_rewrite__variables,
+    attempt_rewrite__zeroshot,
     build_model_openrouter,
 )
 
@@ -31,9 +31,9 @@ if __name__ == "__main__":
     N = 2
     N_JOBS = 2
 
-    attempt_rewrite__oneshot(
+    attempt_rewrite__zeroshot(
         input_verilog=input_verilog,
-        work_dir=DIR_CURRENT / "work" / top_module,
+        work_dir=DIR_CURRENT / "work" / (top_module + "__zeroshot"),
         top_module=top_module,
         design_dir=design_dir,
         llm=llm,

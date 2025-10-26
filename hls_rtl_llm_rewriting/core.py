@@ -72,8 +72,9 @@ def formal_equiv_yosys(
 
     s += "[strategy induction]\n"
     s += "use sby\n"
-    # s += "engine smtbmc z3\n"
-    s += "engine abc pdr\n"
+    s += "engine smtbmc bitwuzla\n"
+    # s += "engine abc pdr\n"
+    s += "depth 8\n"
 
     eqy_config_fp.write_text(s)
 
@@ -211,7 +212,7 @@ def build_model_openrouter(model_id: str, api_key: str) -> OpenRouterChat:
     )
 
 
-def attempt_rewrite__oneshot(
+def attempt_rewrite__zeroshot(
     input_verilog: str,
     work_dir: Path,
     top_module: str,

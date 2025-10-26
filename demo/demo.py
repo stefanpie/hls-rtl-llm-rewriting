@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from hls_rtl_llm_rewriting.main import (
+from hls_rtl_llm_rewriting.core import (
     attempt_rewrite__oneshot,
     attempt_rewrite__variables,
     build_model_openrouter,

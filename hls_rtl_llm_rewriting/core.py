@@ -224,6 +224,15 @@ def attempt_rewrite__oneshot(
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    design_name = design_dir.name
+    module_name = top_module
+    metadata = {
+        "name_design": design_name,
+        "name_module": module_name,
+    }
+    metadata_fp = work_dir / "metadata.json"
+    metadata_fp.write_text(json.dumps(metadata, indent=4))
+
     original_fp = work_dir / "original.v"
     original_fp.write_text(input_verilog)
 
@@ -435,6 +444,15 @@ def attempt_rewrite__variables(
     if work_dir.exists() is True:
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    design_name = design_dir.name
+    module_name = top_module
+    metadata = {
+        "name_design": design_name,
+        "name_module": module_name,
+    }
+    metadata_fp = work_dir / "metadata.json"
+    metadata_fp.write_text(json.dumps(metadata, indent=4))
 
     original_fp = work_dir / "original.v"
     original_fp.write_text(input_verilog)

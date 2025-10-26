@@ -1,19 +1,23 @@
+import json
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
+from pprint import pp
 from string import Template
+from typing import TypeVar
 
 from dotenv import load_dotenv
 from llm_openrouter import OpenRouterChat
 
 load_dotenv()
 
-DIR_CURRENT = Path(__file__).parent
+
+T_unwrap = TypeVar("T_unwrap")
 
 
-def unwrap[T](x: T | None) -> T:
+def unwrap(x: T_unwrap | None) -> T_unwrap:
     if x is None:
         raise ValueError("Unwrapped a None Value")
     return x
@@ -66,20 +70,37 @@ def formal_equiv_yosys(
 
     s += "[strategy induction]\n"
     s += "use sby\n"
-    s += "engine smtbmc z3\n"
+    # s += "engine smtbmc z3\n"
+    s += "engine abc pdr\n"
 
     eqy_config_fp.write_text(s)
 
+    N_JOBS = 32
+
     eqy_bin = unwrap(find_bin("eqy"))
-    args = [str(eqy_bin), eqy_config_fp]
+    args = [str(eqy_bin), "--jobs", str(N_JOBS), eqy_config_fp]
 
     p = subprocess.run(args, capture_output=True, text=True, cwd=work_dir)
 
     log_fp = work_dir / "log.txt"
     log_fp.write_text(p.stdout + "\n\n\n" + p.stderr)
 
+    if p.returncode != 0:
+        return False
 
-def check_design(
+    if not log_fp.exists():
+        raise RuntimeError("Yosys EQY log file not found")
+    txt_log = log_fp.read_text()
+    txt_lines = [line.strip() for line in txt_log.splitlines() if line.strip()]
+    txt_last_line = txt_lines[-1]
+
+    if "PASS" not in txt_last_line:
+        return False
+    else:
+        return True
+
+
+def check_design_synth(
     verilog_txt: str, work_dir: Path, top_module: str, design_dir: Path
 ) -> bool:
     if work_dir.exists() is True:
@@ -113,7 +134,8 @@ def check_design(
     p_txt_fp = work_dir / "process.txt"
     p_txt_fp.write_text(p.stdout + "\n\n\n" + p.stderr)
 
-    return p.returncode == 0
+    passed = p.returncode == 0
+    return passed
 
 
 SYSTEM_PROMPT = """
@@ -197,6 +219,7 @@ def attempt_rewrite__oneshot(
     work_dir: Path,
     top_module: str,
     design_dir: Path,
+    N: int = 1,
 ):
     if work_dir.exists() is True:
         shutil.rmtree(work_dir)
@@ -207,8 +230,6 @@ def attempt_rewrite__oneshot(
 
     rewrite_attempts_dir = work_dir / "rewrite_attempts"
     rewrite_attempts_dir.mkdir(parents=True, exist_ok=True)
-
-    N = 5
 
     for i in range(N):
         rewritten_attempt_dir = rewrite_attempts_dir / f"rewritten__{i}"
@@ -225,7 +246,7 @@ def attempt_rewrite__oneshot(
         rewritten_fp = rewritten_attempt_dir / "rewritten.v"
         rewritten_fp.write_text(code)
 
-        check_passed = check_design(
+        check_passed = check_design_synth(
             verilog_txt=code,
             work_dir=rewritten_attempt_dir / "check_design",
             top_module=top_module,
@@ -239,12 +260,166 @@ def attempt_rewrite__oneshot(
             design_dir=design_dir,
         )
 
+        results = {
+            "check_synth": check_passed,
+            "check_equiv": check_equiv_passed,
+        }
+
+        results_fp = rewritten_attempt_dir / "results.json"
+        results_fp.write_text(json.dumps(results, indent=4))
+
+
+def extract_non_port_vars_from_slang_ast(ast: dict) -> list[str]:
+    """Return a list of nets/variables declared in the top-level InstanceBody
+    that are not also ports.
+
+    Walks the AST looking for an object with "kind" == "InstanceBody"
+    (the top module body), collects members where kind is one of
+    ('Port','Net','Variable') and returns nets+variables minus ports.
+    """
+
+    def find_instance_body(node: object) -> dict | None:
+        if not isinstance(node, dict):
+            return None
+        if node.get("kind") == "InstanceBody":
+            return node
+        for v in node.values():
+            if isinstance(v, dict):
+                found = find_instance_body(v)
+                if found:
+                    return found
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        found = find_instance_body(item)
+                        if found:
+                            return found
+        return None
+
+    body = find_instance_body(ast)
+    if body is None:
+        raise ValueError("No InstanceBody found in AST")
+
+    members = body.get("members", [])
+    port_names = set()
+    net_names = set()
+    var_names = set()
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        kind = m.get("kind")
+        name = m.get("name")
+        if not name:
+            continue
+        if kind == "Port":
+            port_names.add(name)
+        elif kind == "Net":
+            net_names.add(name)
+        elif kind == "Variable":
+            var_names.add(name)
+
+    return sorted((net_names | var_names) - port_names)
+
+
+def extract_vars_for_module(ast: dict, module_name: str) -> list[str]:
+    """Find the Instance with the given module_name and return its non-port
+    nets/variables.
+
+    This is safer if the AST contains multiple modules/instances.
+    """
+    if not isinstance(ast, dict):
+        raise TypeError("ast must be a dict")
+
+    # Search for an Instance node with matching name
+    def find_instance(node: object) -> dict | None:
+        if not isinstance(node, dict):
+            return None
+        if node.get("kind") == "Instance" and node.get("name") == module_name:
+            return node
+        for v in node.values():
+            if isinstance(v, dict):
+                found = find_instance(v)
+                if found:
+                    return found
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        found = find_instance(item)
+                        if found:
+                            return found
+        return None
+
+    inst = find_instance(ast)
+    if inst is None:
+        # fallback: if there's only one InstanceBody in the AST, use it
+        try:
+            return extract_non_port_vars_from_slang_ast(ast)
+        except Exception:
+            raise ValueError(f"Module {module_name} not found in AST")
+
+    # instance node should have a 'body' with 'members'
+    body = inst.get("body")
+    if not isinstance(body, dict) or "members" not in body:
+        raise ValueError(f"Instance for module {module_name} has no body/members")
+
+    members = body.get("members", [])
+    port_names = set()
+    net_names = set()
+    var_names = set()
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        kind = m.get("kind")
+        name = m.get("name")
+        if not name:
+            continue
+        if kind == "Port":
+            port_names.add(name)
+        elif kind == "Net":
+            net_names.add(name)
+        elif kind == "Variable":
+            var_names.add(name)
+
+    return sorted((net_names | var_names) - port_names)
+
+
+SYSTEM_PROMPT_VAR = """
+You are an High Level Synthesis (HLS) and Verilog expert.
+The goal is to rename auto-generated variables in the auto-generated Verilog code from HLS tools to be simpler, higher-level, human-readable HDL.
+You will be given a Verilog code that was generated by an HLS tool (like Vitis HLS) as well as a list of variable names in the design that are available to rename.
+You will create a mapping of old variable names to new variable names you suggest that improve clarity, structure, function, debuggability, and readability while preserving the same functionality.
+You dont have to stricly rename all variables, but try to rename as many as possible to improve the HDL as much as possible.
+Avoid "tmp" or "temp" in the new variable names. These do not improve clarity.
+
+Only respond with a JSON object mapping old variable names to new variable names. The type is `dict[str, str]`.
+The output should be a markdown code block with language `json`, containing only the JSON object with only the mapping.
+Example output:
+```json
+{
+    "old_var1": "new_var1",
+    "old_var2": "new_var2",
+}
+```
+""".strip()
+
+USER_PROMPT_VAR = """
+INPUT VERILOG
+```verilog
+${input_verilog}
+```
+VARIABLES THAT CAN BE RENAMED:
+```txt
+${variable_list}
+```
+""".strip()
+
 
 def attempt_rewrite__variables(
     input_verilog: str,
     work_dir: Path,
     top_module: str,
     design_dir: Path,
+    N: int = 1,
 ):
     # TODO: Implement a variable-only based LLM rewriting approach
     # Input prompt is the original verilog with the verilog module + variables in the module we want to rename
@@ -255,9 +430,132 @@ def attempt_rewrite__variables(
     # - Maybe use parser / AST to do the renaming based on the LLM generated mapping
     #   or use some regex somehow carefully to rename variables a hacky way
 
+    if work_dir.exists() is True:
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    original_fp = work_dir / "original.v"
+    original_fp.write_text(input_verilog)
+
+    yosys_script = f"""
+    plugin -i slang
+    read_slang --dump-ast --ignore-timing --ast-compilation-only --ignore-unknown-modules {str(original_fp)}
+    """
+    yosys_script_fp = work_dir / "get_ast.ys"
+    yosys_script_fp.write_text(yosys_script)
+
+    cmd = ["yosys", "-s", str(yosys_script_fp)]
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=work_dir)
+    if p.returncode != 0:
+        print("Error running yosys to get AST:")
+        print(p.stdout)
+        print(p.stderr)
+        raise RuntimeError("Yosys failed to get AST")
+
+    stdout = p.stdout
+    ast_json_txt = stdout[stdout.index("{") : stdout.rindex("}") + 1]
+    ast = json.loads(ast_json_txt)
+    ast_fp = work_dir / "ast.json"
+    ast_fp.write_text(json.dumps(ast, indent=4))
+
+    vars_for_module = extract_vars_for_module(ast, top_module)
+    vars_fp = work_dir / "variables.json"
+    vars_fp.write_text(json.dumps(vars_for_module, indent=2))
+
+    rewrite_attempts_dir = work_dir / "rewrite_attempts"
+    rewrite_attempts_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(N):
+        rewritten_attempt_dir = rewrite_attempts_dir / f"rewritten__{i}"
+        rewritten_attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        # pass the variable list to the LLM prompt (string form)
+        variable_list_txt = "\n".join(vars_for_module)
+        user_prompt = USER_PROMPT_VAR.replace(
+            "${input_verilog}", input_verilog
+        ).replace("${variable_list}", variable_list_txt)
+
+        prompt_vis = ""
+        prompt_vis += "SYSTEM PROMPT:\n\n"
+        prompt_vis += SYSTEM_PROMPT_VAR + "\n\n\n"
+        prompt_vis += "USER PROMPT:\n\n"
+        prompt_vis += user_prompt
+        llm_prompt_fp = rewritten_attempt_dir / "llm_prompt.txt"
+        llm_prompt_fp.write_text(prompt_vis)
+
+        print(f"Attempt {i}: Sending prompt to LLM")
+        response = llm.prompt(
+            user_prompt, system=SYSTEM_PROMPT_VAR, provider=MODEL_PROVIDER
+        )
+        response_txt = response.text()
+
+        # save LLM response raw and parse when appropriate
+        (rewritten_attempt_dir / "llm_response.txt").write_text(response_txt)
+
+        code, lang = extract_fenced_code(response_txt)
+        # try to parse JSON
+        try:
+            var_mapping = json.loads(code)
+        except Exception as e:
+            print(f"Failed to parse JSON from LLM response in attempt {i}: {e}")
+            continue
+        (rewritten_attempt_dir / "var_mapping.json").write_text(
+            json.dumps(var_mapping, indent=4)
+        )
+
+        old_vars = list(var_mapping.keys())
+        new_vars = list(var_mapping.values())
+
+        # make sure new vars are unique
+        if len(new_vars) != len(set(new_vars)):
+            print(f"New variable names are not unique in attempt {i}")
+            non_unique = set(v for v in new_vars if new_vars.count(v) > 1)
+            print(f"Non-unique new variable names: {non_unique}")
+
+        # make sure old vars exist in the original var list
+        for ov in old_vars:
+            if ov not in vars_for_module:
+                print(
+                    f"Old variable {ov} not found in original variable list in attempt {i}"
+                )
+
+        rewritten_verilog = input_verilog
+        var_map_items = sorted(var_mapping.items(), key=lambda x: -len(x[0]))
+        for old_var, new_var in var_map_items:
+            rewritten_verilog = re.sub(
+                rf"(?<![.\\])\b{re.escape(old_var)}\b", new_var, rewritten_verilog
+            )
+        rewritten_fp = rewritten_attempt_dir / "rewritten.v"
+        rewritten_fp.write_text(rewritten_verilog)
+
+        check_passed = check_design_synth(
+            verilog_txt=rewritten_verilog,
+            work_dir=rewritten_attempt_dir / "check_design",
+            top_module=top_module,
+            design_dir=design_dir,
+        )
+        check_equiv_passed = formal_equiv_yosys(
+            original_txt=input_verilog,
+            rewritten_txt=rewritten_verilog,
+            work_dir=rewritten_attempt_dir / "formal_equiv",
+            top_module=top_module,
+            design_dir=design_dir,
+        )
+
+        results = {
+            "check_synth": check_passed,
+            "check_equiv": check_equiv_passed,
+        }
+        results_fp = rewritten_attempt_dir / "results.json"
+        results_fp.write_text(json.dumps(results, indent=4))
+
 
 if __name__ == "__main__":
+    DIR_CURRENT = Path(__file__).parent
+
     # kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2
+    # kernel_2mm_flow_control_loop_pipe_sequential_init
+    # kernel_2mm
 
     design_dir = DIR_CURRENT / "test_design"
     test_file_name = "kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2.v"
@@ -265,9 +563,21 @@ if __name__ == "__main__":
     top_module = "kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2"
 
     input_verilog = test_file_fp.read_text()
-    attempt_rewrite__oneshot(
+
+    N = 2
+
+    # attempt_rewrite__oneshot(
+    #     input_verilog=input_verilog,
+    #     work_dir=DIR_CURRENT / "work" / top_module,
+    #     top_module=top_module,
+    #     design_dir=design_dir,
+    #     N=N,
+    # )
+
+    attempt_rewrite__variables(
         input_verilog=input_verilog,
-        work_dir=DIR_CURRENT / "work" / top_module,
+        work_dir=DIR_CURRENT / "work" / (top_module + "_variables"),
         top_module=top_module,
         design_dir=design_dir,
+        N=N,
     )

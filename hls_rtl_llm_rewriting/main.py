@@ -9,6 +9,8 @@ from string import Template
 from typing import TypeVar
 
 from dotenv import load_dotenv
+from joblib import Parallel, delayed
+from llm import Model
 from llm_openrouter import OpenRouterChat
 
 load_dotenv()
@@ -200,18 +202,13 @@ def extract_fenced_code(markdown_text: str) -> tuple[str, str | None]:
     return code, lang
 
 
-MODEL_ID = "openai/gpt-oss-120b"
-MODEL_PROVIDER = {"only": ["chutes"]}
-
-# MODEL_ID = "google/gemini-2.5-flash"
-# MODEL_PROVIDER = {"only": ["google-vertex"]}
-
-llm: OpenRouterChat = OpenRouterChat(
-    model_id=MODEL_ID,
-    key=os.getenv("OPENROUTER_API_KEY"),
-    api_base="https://openrouter.ai/api/v1",
-    headers={"HTTP-Referer": "https://llm.datasette.io/", "X-Title": "LLM"},
-)
+def build_model_openrouter(model_id: str, api_key: str) -> OpenRouterChat:
+    return OpenRouterChat(
+        model_id=model_id,
+        key=api_key,
+        api_base="https://openrouter.ai/api/v1",
+        headers={"HTTP-Referer": "https://llm.datasette.io/", "X-Title": "LLM"},
+    )
 
 
 def attempt_rewrite__oneshot(
@@ -219,7 +216,9 @@ def attempt_rewrite__oneshot(
     work_dir: Path,
     top_module: str,
     design_dir: Path,
-    N: int = 1,
+    llm: Model | OpenRouterChat,
+    n: int = 1,
+    n_jobs: int = 1,
 ):
     if work_dir.exists() is True:
         shutil.rmtree(work_dir)
@@ -231,16 +230,22 @@ def attempt_rewrite__oneshot(
     rewrite_attempts_dir = work_dir / "rewrite_attempts"
     rewrite_attempts_dir.mkdir(parents=True, exist_ok=True)
 
-    for i in range(N):
+    def process_attempt(i: int):
         rewritten_attempt_dir = rewrite_attempts_dir / f"rewritten__{i}"
         rewritten_attempt_dir.mkdir(parents=True, exist_ok=True)
 
         prompt = PROMPT_TEMPLATE.substitute(input_verilog=input_verilog)
 
+        llm_input_fp = rewritten_attempt_dir / "llm_prompt.txt"
+        llm_input_fp.write_text(prompt)
+
         print(f"Attempt {i}: Sending prompt to LLM...")
-        response = llm.prompt(prompt, system=SYSTEM_PROMPT, provider=MODEL_PROVIDER)
+        response = llm.prompt(prompt, system=SYSTEM_PROMPT)
         response_txt = response.text()
         print(f"Attempt {i}: Received response from LLM.")
+
+        llm_output_fp = rewritten_attempt_dir / "llm_response.txt"
+        llm_output_fp.write_text(response_txt)
 
         code, lang = extract_fenced_code(response_txt)
         rewritten_fp = rewritten_attempt_dir / "rewritten.v"
@@ -267,6 +272,10 @@ def attempt_rewrite__oneshot(
 
         results_fp = rewritten_attempt_dir / "results.json"
         results_fp.write_text(json.dumps(results, indent=4))
+
+    Parallel(n_jobs=n_jobs, backend="threading")(
+        delayed(process_attempt)(i) for i in range(n)
+    )
 
 
 def extract_non_port_vars_from_slang_ast(ast: dict) -> list[str]:
@@ -419,17 +428,10 @@ def attempt_rewrite__variables(
     work_dir: Path,
     top_module: str,
     design_dir: Path,
-    N: int = 1,
+    llm: Model | OpenRouterChat,
+    n: int = 1,
+    n_jobs: int = 1,
 ):
-    # TODO: Implement a variable-only based LLM rewriting approach
-    # Input prompt is the original verilog with the verilog module + variables in the module we want to rename
-    # LLM output should be a mapping of old variable names we listed to new variable names
-    # Other Notes:
-    # - Maybe use structured output for LLM
-    # - Maybe use multiple rounds of variable renaming
-    # - Maybe use parser / AST to do the renaming based on the LLM generated mapping
-    #   or use some regex somehow carefully to rename variables a hacky way
-
     if work_dir.exists() is True:
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -465,11 +467,10 @@ def attempt_rewrite__variables(
     rewrite_attempts_dir = work_dir / "rewrite_attempts"
     rewrite_attempts_dir.mkdir(parents=True, exist_ok=True)
 
-    for i in range(N):
+    def process_attempt(i: int):
         rewritten_attempt_dir = rewrite_attempts_dir / f"rewritten__{i}"
         rewritten_attempt_dir.mkdir(parents=True, exist_ok=True)
 
-        # pass the variable list to the LLM prompt (string form)
         variable_list_txt = "\n".join(vars_for_module)
         user_prompt = USER_PROMPT_VAR.replace(
             "${input_verilog}", input_verilog
@@ -480,25 +481,23 @@ def attempt_rewrite__variables(
         prompt_vis += SYSTEM_PROMPT_VAR + "\n\n\n"
         prompt_vis += "USER PROMPT:\n\n"
         prompt_vis += user_prompt
+
         llm_prompt_fp = rewritten_attempt_dir / "llm_prompt.txt"
         llm_prompt_fp.write_text(prompt_vis)
 
         print(f"Attempt {i}: Sending prompt to LLM")
-        response = llm.prompt(
-            user_prompt, system=SYSTEM_PROMPT_VAR, provider=MODEL_PROVIDER
-        )
+        response = llm.prompt(user_prompt, system=SYSTEM_PROMPT_VAR)
         response_txt = response.text()
 
-        # save LLM response raw and parse when appropriate
-        (rewritten_attempt_dir / "llm_response.txt").write_text(response_txt)
+        llm_response_fp = rewritten_attempt_dir / "llm_response.txt"
+        llm_response_fp.write_text(response_txt)
 
         code, lang = extract_fenced_code(response_txt)
-        # try to parse JSON
         try:
             var_mapping = json.loads(code)
         except Exception as e:
             print(f"Failed to parse JSON from LLM response in attempt {i}: {e}")
-            continue
+            return
         (rewritten_attempt_dir / "var_mapping.json").write_text(
             json.dumps(var_mapping, indent=4)
         )
@@ -506,13 +505,11 @@ def attempt_rewrite__variables(
         old_vars = list(var_mapping.keys())
         new_vars = list(var_mapping.values())
 
-        # make sure new vars are unique
         if len(new_vars) != len(set(new_vars)):
             print(f"New variable names are not unique in attempt {i}")
             non_unique = set(v for v in new_vars if new_vars.count(v) > 1)
             print(f"Non-unique new variable names: {non_unique}")
 
-        # make sure old vars exist in the original var list
         for ov in old_vars:
             if ov not in vars_for_module:
                 print(
@@ -549,35 +546,6 @@ def attempt_rewrite__variables(
         results_fp = rewritten_attempt_dir / "results.json"
         results_fp.write_text(json.dumps(results, indent=4))
 
-
-if __name__ == "__main__":
-    DIR_CURRENT = Path(__file__).parent
-
-    # kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2
-    # kernel_2mm_flow_control_loop_pipe_sequential_init
-    # kernel_2mm
-
-    design_dir = DIR_CURRENT / "test_design"
-    test_file_name = "kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2.v"
-    test_file_fp = design_dir / test_file_name
-    top_module = "kernel_2mm_kernel_2mm_Pipeline_VITIS_LOOP_27_1_VITIS_LOOP_28_2"
-
-    input_verilog = test_file_fp.read_text()
-
-    N = 2
-
-    # attempt_rewrite__oneshot(
-    #     input_verilog=input_verilog,
-    #     work_dir=DIR_CURRENT / "work" / top_module,
-    #     top_module=top_module,
-    #     design_dir=design_dir,
-    #     N=N,
-    # )
-
-    attempt_rewrite__variables(
-        input_verilog=input_verilog,
-        work_dir=DIR_CURRENT / "work" / (top_module + "_variables"),
-        top_module=top_module,
-        design_dir=design_dir,
-        N=N,
+    Parallel(n_jobs=n_jobs, backend="threading")(
+        delayed(process_attempt)(i) for i in range(n)
     )

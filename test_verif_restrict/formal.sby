@@ -1,0 +1,18 @@
+[tasks]
+with_constraint
+without_constraint
+
+[options]
+mode prove
+
+[engines]
+smtbmc boolector
+
+[script]
+read_verilog -sv -formal equiv_check.sv design_v1.sv design_v2.sv
+prep -top equiv_check
+
+[files]
+equiv_check.sv
+design_v1.sv
+design_v2.sv

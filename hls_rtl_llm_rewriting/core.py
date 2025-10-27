@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from pprint import pp
 from string import Template
@@ -141,6 +142,17 @@ def check_design_synth(
     return passed
 
 
+class EvalPool:
+    def __init__(self, n_jobs_synth: int, n_jobs_equiv: int, n_jobs_llm: int):
+        self.n_jobs_synth = n_jobs_synth
+        self.n_jobs_equiv = n_jobs_equiv
+        self.n_jobs_llm = n_jobs_llm
+
+        self.pool_synth = ThreadPool(n_jobs_synth)
+        self.pool_equiv = ThreadPool(n_jobs_equiv)
+        self.pool_llm = ThreadPool(n_jobs_llm)
+
+
 SYSTEM_PROMPT = """
 You are an High Level Synthesis (HLS) and Verilog expert.
 The goal is to rewrite the generated Verilog code from HLS tools to be simpler and higher-level HDL.
@@ -218,6 +230,7 @@ def attempt_rewrite__zeroshot(
     top_module: str,
     design_dir: Path,
     llm: Model | OpenRouterChat,
+    eval_pool: EvalPool,
     n: int = 1,
     n_jobs: int = 1,
 ):
@@ -250,8 +263,16 @@ def attempt_rewrite__zeroshot(
         llm_input_fp.write_text(prompt)
 
         print(f"Attempt {i}: Sending prompt to LLM...")
-        response = llm.prompt(prompt, system=SYSTEM_PROMPT)
-        response_txt = response.text()
+
+        # response = llm.prompt(prompt, system=SYSTEM_PROMPT)
+        # response_txt = response.text()
+
+        def call_llm():
+            response = llm.prompt(prompt, system=SYSTEM_PROMPT)
+            return response.text()
+
+        response_txt = eval_pool.pool_llm.apply(call_llm)
+
         print(f"Attempt {i}: Received response from LLM.")
 
         llm_output_fp = rewritten_attempt_dir / "llm_response.txt"
@@ -261,19 +282,40 @@ def attempt_rewrite__zeroshot(
         rewritten_fp = rewritten_attempt_dir / "rewritten.v"
         rewritten_fp.write_text(code)
 
-        check_passed = check_design_synth(
-            verilog_txt=code,
-            work_dir=rewritten_attempt_dir / "check_design",
-            top_module=top_module,
-            design_dir=design_dir,
-        )
-        check_equiv_passed = formal_equiv_yosys(
-            original_txt=input_verilog,
-            rewritten_txt=code,
-            work_dir=rewritten_attempt_dir / "formal_equiv",
-            top_module=top_module,
-            design_dir=design_dir,
-        )
+        # check_passed = check_design_synth(
+        #     verilog_txt=code,
+        #     work_dir=rewritten_attempt_dir / "check_design",
+        #     top_module=top_module,
+        #     design_dir=design_dir,
+        # )
+        # check_equiv_passed = formal_equiv_yosys(
+        #     original_txt=input_verilog,
+        #     rewritten_txt=code,
+        #     work_dir=rewritten_attempt_dir / "formal_equiv",
+        #     top_module=top_module,
+        #     design_dir=design_dir,
+        # )
+
+        def call_check_synth():
+            return check_design_synth(
+                verilog_txt=code,
+                work_dir=rewritten_attempt_dir / "check_design",
+                top_module=top_module,
+                design_dir=design_dir,
+            )
+
+        check_passed = eval_pool.pool_synth.apply(call_check_synth)
+
+        def call_check_equiv():
+            return formal_equiv_yosys(
+                original_txt=input_verilog,
+                rewritten_txt=code,
+                work_dir=rewritten_attempt_dir / "formal_equiv",
+                top_module=top_module,
+                design_dir=design_dir,
+            )
+
+        check_equiv_passed = eval_pool.pool_equiv.apply(call_check_equiv)
 
         results = {
             "check_synth": check_passed,
@@ -439,6 +481,7 @@ def attempt_rewrite__variables(
     top_module: str,
     design_dir: Path,
     llm: Model | OpenRouterChat,
+    eval_pool: EvalPool,
     n: int = 1,
     n_jobs: int = 1,
 ):
@@ -505,8 +548,17 @@ def attempt_rewrite__variables(
         llm_prompt_fp.write_text(prompt_vis)
 
         print(f"Attempt {i}: Sending prompt to LLM")
-        response = llm.prompt(user_prompt, system=SYSTEM_PROMPT_VAR)
-        response_txt = response.text()
+
+        # response = llm.prompt(user_prompt, system=SYSTEM_PROMPT_VAR)
+        # response_txt = response.text()
+
+        def call_llm():
+            response = llm.prompt(user_prompt, system=SYSTEM_PROMPT_VAR)
+            return response.text()
+
+        response_txt = eval_pool.pool_llm.apply(call_llm)
+
+        print(f"Attempt {i}: Received response from LLM")
 
         llm_response_fp = rewritten_attempt_dir / "llm_response.txt"
         llm_response_fp.write_text(response_txt)
@@ -544,19 +596,39 @@ def attempt_rewrite__variables(
         rewritten_fp = rewritten_attempt_dir / "rewritten.v"
         rewritten_fp.write_text(rewritten_verilog)
 
-        check_passed = check_design_synth(
-            verilog_txt=rewritten_verilog,
-            work_dir=rewritten_attempt_dir / "check_design",
-            top_module=top_module,
-            design_dir=design_dir,
-        )
-        check_equiv_passed = formal_equiv_yosys(
-            original_txt=input_verilog,
-            rewritten_txt=rewritten_verilog,
-            work_dir=rewritten_attempt_dir / "formal_equiv",
-            top_module=top_module,
-            design_dir=design_dir,
-        )
+        # check_passed = check_design_synth(
+        #     verilog_txt=rewritten_verilog,
+        #     work_dir=rewritten_attempt_dir / "check_design",
+        #     top_module=top_module,
+        #     design_dir=design_dir,
+        # )
+        def call_check_synth():
+            return check_design_synth(
+                verilog_txt=rewritten_verilog,
+                work_dir=rewritten_attempt_dir / "check_design",
+                top_module=top_module,
+                design_dir=design_dir,
+            )
+
+        check_passed = eval_pool.pool_synth.apply(call_check_synth)
+
+        # check_equiv_passed = formal_equiv_yosys(
+        #     original_txt=input_verilog,
+        #     rewritten_txt=rewritten_verilog,
+        #     work_dir=rewritten_attempt_dir / "formal_equiv",
+        #     top_module=top_module,
+        #     design_dir=design_dir,
+        # )
+        def call_check_equiv():
+            return formal_equiv_yosys(
+                original_txt=input_verilog,
+                rewritten_txt=rewritten_verilog,
+                work_dir=rewritten_attempt_dir / "formal_equiv",
+                top_module=top_module,
+                design_dir=design_dir,
+            )
+
+        check_equiv_passed = eval_pool.pool_equiv.apply(call_check_equiv)
 
         results = {
             "check_synth": check_passed,
